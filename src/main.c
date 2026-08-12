@@ -1,7 +1,9 @@
 #include <math.h>
 #include <raylib.h>
 #include <raymath.h>
+#include <rlgl.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -29,6 +31,10 @@ typedef struct {
 } Polygon;
 
 typedef struct {
+  Vector3 p1, p2, p3;
+} Triangle;
+
+typedef struct {
   Point *points;
   size_t points_len;
   Spring *springs;
@@ -43,20 +49,24 @@ typedef enum {
   OBJECT_RECTANGLE,
 } ObjectType;
 
+typedef union {
+  struct {
+    float radius;
+  } sphere;
+  struct {
+    float width;
+    float height;
+    float length;
+  } rectangle;
+} ObjectData;
+
 typedef struct {
   ObjectType type;
   Vector3 position;
   Color color;
-  union {
-    struct {
-      float radius;
-    } sphere;
-    struct {
-      float width;
-      float height;
-      float length;
-    } rectangle;
-  } as;
+  Triangle *triangles;
+  size_t triangles_len;
+  ObjectData as;
 } Object;
 
 Cloth create_cloth(Vector3 pos, Vector2 size, Vector2 res, Color color) {
@@ -67,9 +77,9 @@ Cloth create_cloth(Vector3 pos, Vector2 size, Vector2 res, Color color) {
   for (int i = 0; i < res.y; i++) {
     for (int j = 0; j < res.x; j++) {
       size_t idx = res.y * i + j;
-      Point *p = &points[idx];
-      p->pos = p->prev_pos = (Vector3){pos.x + step_x * j, pos.y, pos.z + step_z * i};
-      p->mass = 1.0f;
+      Point *point = &points[idx];
+      point->pos = point->prev_pos = (Vector3){pos.x + step_x * j, pos.y, pos.z + step_z * i};
+      point->mass = 1.0f;
     }
   }
 
@@ -106,42 +116,78 @@ Cloth create_cloth(Vector3 pos, Vector2 size, Vector2 res, Color color) {
   };
 }
 
+Object create_object(ObjectType type, Vector3 position, Color color, ObjectData data) {
+  Mesh mesh;
+  switch (type) {
+  case OBJECT_SPHERE:
+    mesh = GenMeshSphere(data.sphere.radius, 72, 24);
+    break;
+  case OBJECT_RECTANGLE:
+    mesh = GenMeshCube(data.rectangle.width, data.rectangle.height, data.rectangle.length);
+    break;
+  }
+  Triangle *triangles = malloc(sizeof(Triangle) * mesh.triangleCount);
+  Vector3 *vertices = (Vector3 *)mesh.vertices;
+  uint16_t *indices = mesh.indices;
+  for (int i = 0; i < mesh.triangleCount; i++) {
+    Vector3 p1, p2, p3;
+    if (indices) {
+      p1 = vertices[indices[i * 3 + 0]];
+      p2 = vertices[indices[i * 3 + 1]];
+      p3 = vertices[indices[i * 3 + 2]];
+    } else {
+      p1 = vertices[i * 3 + 0];
+      p2 = vertices[i * 3 + 1];
+      p3 = vertices[i * 3 + 2];
+    }
+    triangles[i] = (Triangle){p1, p2, p3};
+  }
+  return (Object){
+    .type = type,
+    .position = position,
+    .color = color,
+    .triangles = triangles,
+    .triangles_len = mesh.triangleCount,
+    .as = data,
+  };
+}
+
 void apply_physics(Cloth *cloth) {
   Vector3 spring_forces[cloth->points_len];
   for (int i = 0; i < cloth->points_len; i++) {
     spring_forces[i] = (Vector3){0.0f, 0.0f, 0.0f};
   }
   for (int i = 0; i < cloth->springs_len; i++) {
-    Spring *s = &cloth->springs[i];
-    Point *p1 = &cloth->points[s->p1], *p2 = &cloth->points[s->p2];
+    Spring *spring = &cloth->springs[i];
+    Point *p1 = &cloth->points[spring->p1], *p2 = &cloth->points[spring->p2];
     Vector3 dir = Vector3Normalize(Vector3Subtract(p2->pos, p1->pos));
-    float delta = Vector3Distance(p1->pos, p2->pos) - s->rest_length;
-    Vector3 force = Vector3Scale(dir, s->k * delta);
-    spring_forces[s->p1] = Vector3Add(spring_forces[s->p1], force);
-    spring_forces[s->p2] = Vector3Subtract(spring_forces[s->p2], force);
+    float delta = Vector3Distance(p1->pos, p2->pos) - spring->rest_length;
+    Vector3 force = Vector3Scale(dir, spring->k * delta);
+    spring_forces[spring->p1] = Vector3Add(spring_forces[spring->p1], force);
+    spring_forces[spring->p2] = Vector3Subtract(spring_forces[spring->p2], force);
   }
   for (int i = 0; i < cloth->points_len; i++) {
-    Point *p = &cloth->points[i];
-    Vector3 force = Vector3Add(spring_forces[i], (Vector3){0.0f, -p->mass * G, 0.0f});
-    p->acceleration = Vector3Scale(force, 1.0f / p->mass);
+    Point *point = &cloth->points[i];
+    Vector3 force = Vector3Add(spring_forces[i], (Vector3){0.0f, -point->mass * G, 0.0f});
+    point->acceleration = Vector3Scale(force, 1.0f / point->mass);
   }
 }
 
 void move_cloth(Cloth *cloth, float dt) {
   for (int i = 0; i < cloth->points_len; i++) {
-    Point *p = &cloth->points[i];
-    Vector3 tmp1 = Vector3Scale(p->pos, 2.0f);
-    Vector3 tmp2 = Vector3Scale(p->acceleration, dt * dt);
-    Vector3 tmp3 = p->prev_pos;
-    p->prev_pos = p->pos;
-    p->pos = Vector3Add(Vector3Subtract(tmp1, tmp3), tmp2);
+    Point *point = &cloth->points[i];
+    Vector3 tmp1 = Vector3Scale(point->pos, 2.0f);
+    Vector3 tmp2 = Vector3Scale(point->acceleration, dt * dt);
+    Vector3 tmp3 = point->prev_pos;
+    point->prev_pos = point->pos;
+    point->pos = Vector3Add(Vector3Subtract(tmp1, tmp3), tmp2);
   }
 }
 
 void draw_cloth(const Cloth *cloth) {
   for (int i = 0; i < cloth->polygons_len; i++) {
-    const Polygon *p = &cloth->polygons[i];
-    DrawTriangle3D(cloth->points[p->p1].pos, cloth->points[p->p2].pos, cloth->points[p->p3].pos, cloth->color);
+    const Polygon *polygon = &cloth->polygons[i];
+    DrawTriangle3D(cloth->points[polygon->p1].pos, cloth->points[polygon->p2].pos, cloth->points[polygon->p3].pos, cloth->color);
   }
 }
 
@@ -184,22 +230,30 @@ bool get_intersection_point(Vector3 p1, Vector3 p2, Vector3 a, Vector3 b, Vector
   return false;
 }
 
-void check_collisions(const Cloth *cloth) {
+void check_collision(Point *point, Triangle *triangle) {
+  Vector3 x;
+  if (!get_intersection_point(point->prev_pos, point->pos, triangle->p1, triangle->p2, triangle->p3, &x)) return;
+  Vector3 dir = Vector3Subtract(point->pos, point->prev_pos);
+  float dis = Vector3Distance(point->pos, x);
+  Vector3 offset = Vector3Scale(dir, dis);
+  point->pos = Vector3Subtract(point->pos, offset);
+}
+
+void check_collisions(const Cloth *cloth, const Object *objects, size_t objects_len) {
   for (int i = 0; i < cloth->points_len; i++) {
     Point *point = &cloth->points[i];
     Vector3 dir = Vector3Normalize(Vector3Subtract(point->pos, point->prev_pos));
     for (int j = 0; j < cloth->polygons_len; j++) {
-      Polygon *polygon = &cloth->polygons[i];
+      Polygon *polygon = &cloth->polygons[j];
       if (polygon->p1 == i || polygon->p2 == i || polygon->p3 == i) continue;
-      Point *a = &cloth->points[polygon->p1], *b = &cloth->points[polygon->p2], *c = &cloth->points[polygon->p3];
-      Vector3 x;
-      if (!get_intersection_point(point->prev_pos, point->pos, a->pos, b->pos, c->pos, &x)) continue;
-      float dis = Vector3Distance(point->pos, x) / 2.0f;
-      Vector3 offset = Vector3Scale(dir, dis);
-      point->pos = Vector3Subtract(point->pos, offset);
-      a->pos = Vector3Add(a->pos, offset);
-      b->pos = Vector3Add(b->pos, offset);
-      c->pos = Vector3Add(c->pos, offset);
+      Triangle triangle = {cloth->points[polygon->p1].pos, cloth->points[polygon->p2].pos, cloth->points[polygon->p3].pos};
+      check_collision(point, &triangle);
+    }
+    for (int j = 0; j < objects_len; j++) {
+      const Object *object = &objects[j];
+      for (int k = 0; k < object->triangles_len; k++) {
+        check_collision(point, &objects->triangles[k]);
+      }
     }
   }
 }
@@ -214,14 +268,10 @@ int main() {
   InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_TITLE);
   SetTargetFPS(FPS);
   DisableCursor();
+  rlDisableBackfaceCulling();
 
-  const static Object objects[] = {
-    {
-      .type = OBJECT_SPHERE,
-      .position = {0.0f, 2.0f, 0.0f},
-      .color = RED,
-      .as.sphere = {.radius = 1.0f},
-    },
+  const Object objects[] = {
+    create_object(OBJECT_SPHERE, (Vector3){0.0f, 1.0f, 0.0f}, RED, (ObjectData){.sphere.radius = 1.0f}),
   };
   size_t objects_len = sizeof(objects) / sizeof(*objects);
 
@@ -232,7 +282,7 @@ int main() {
   camera.fovy = 45.0f;
   camera.projection = CAMERA_PERSPECTIVE;
 
-  Cloth cloth = create_cloth((Vector3){0.0f, 5.0f, 0.0f}, (Vector2){3.0f, 3.0f}, (Vector2){10.0f, 10.0f}, BLUE);
+  Cloth cloth = create_cloth((Vector3){-1.5f, 5.0f, -1.5f}, (Vector2){3.0f, 3.0f}, (Vector2){10.0f, 10.0f}, BLUE);
   while (!WindowShouldClose()) {
     float dt = GetFrameTime();
 
@@ -244,6 +294,7 @@ int main() {
 
     apply_physics(&cloth);
     move_cloth(&cloth, dt);
+    check_collisions(&cloth, objects, objects_len);
     draw_cloth(&cloth);
     draw_objects(objects, objects_len);
 
