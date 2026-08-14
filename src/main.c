@@ -10,17 +10,18 @@
 
 // -------------------- DEFINES --------------------
 
-#define G             (9.8f)
-#define K             (4000.0f)
-#define EPS           (0.00001)
-#define FPS           (120.0f)
-#define DAMPING       (0.98f)
-#define FRICTION      (0.9f)
-#define DRAG_FORCE    (10.0f)
-#define SKIN_WIDTH    (0.05f)
-#define SCREEN_WIDTH  (900.0f)
-#define SCREEN_HEIGHT (600.0f)
-#define SCREEN_TITLE  ("Cloth simulation")
+#define G                 (9.8f)
+#define EPS               (0.00001)
+#define FPS               (60.0f)
+#define STIFFNESS         (0.8f)
+#define DAMPING           (0.98f)
+#define FRICTION          (0.9f)
+#define DRAG_FORCE        (40000.0f)
+#define SKIN_WIDTH        (0.05f)
+#define COLLISIONS_CHECKS (8)
+#define SCREEN_WIDTH      (900.0f)
+#define SCREEN_HEIGHT     (600.0f)
+#define SCREEN_TITLE      ("Cloth simulation")
 
 // -------------------- TYPES --------------------
 
@@ -34,7 +35,6 @@ typedef struct {
 typedef struct {
   size_t p1, p2;
   float rest_length;
-  float k;
 } Spring;
 
 typedef struct {
@@ -82,7 +82,8 @@ typedef struct {
 
 typedef struct {
   bool is_dragging;
-  size_t point_idx;
+  size_t polygon_idx;
+  Vector3 point;
   Vector3 dir;
 } DragContext;
 
@@ -109,8 +110,8 @@ Cloth create_cloth(Vector3 pos, Vector2 size, Vector2 res, Color color) {
   for (int i = 0; i < res.y; i++) {
     for (int j = 0; j < res.x; j++) {
       size_t idx = res.x * i + j;
-      if (j < res.x - 1) springs[curr_spring++] = (Spring){idx, idx + 1, step_x, K};
-      if (i < res.y - 1) springs[curr_spring++] = (Spring){idx, idx + res.x, step_z, K};
+      if (j < res.x - 1) springs[curr_spring++] = (Spring){idx, idx + 1, step_x};
+      if (i < res.y - 1) springs[curr_spring++] = (Spring){idx, idx + res.x, step_z};
     }
   }
 
@@ -172,49 +173,15 @@ void draw_objects(const Object *objects, size_t len) {
   }
 }
 
-// -------------------- PHYSICS --------------------
-
-void apply_physics(Cloth *cloth, const DragContext *drag_ctx) {
-  Vector3 spring_forces[cloth->points_len];
-  for (int i = 0; i < cloth->points_len; i++) {
-    spring_forces[i] = (Vector3){0.0f, 0.0f, 0.0f};
-  }
-  for (int i = 0; i < cloth->springs_len; i++) {
-    Spring *spring = &cloth->springs[i];
-    Point *p1 = &cloth->points[spring->p1], *p2 = &cloth->points[spring->p2];
-    Vector3 dir = Vector3Normalize(Vector3Subtract(p2->pos, p1->pos));
-    float dt = Vector3Distance(p1->pos, p2->pos) - spring->rest_length;
-    Vector3 spring_force = Vector3Scale(dir, spring->k * dt);
-    spring_forces[spring->p1] = Vector3Add(spring_forces[spring->p1], spring_force);
-    spring_forces[spring->p2] = Vector3Subtract(spring_forces[spring->p2], spring_force);
-  }
-  for (int i = 0; i < cloth->points_len; i++) {
-    Point *point = &cloth->points[i];
-    Vector3 spring_force = spring_forces[i];
-    Vector3 gravity_force = {0.0f, -point->mass * G, 0.0f};
-    Vector3 force = Vector3Add(spring_force, gravity_force);
-    if (drag_ctx->is_dragging && drag_ctx->point_idx == i) force = Vector3Add(force, Vector3Scale(drag_ctx->dir, DRAG_FORCE));
-    point->acceleration = Vector3Scale(force, 1.0f / point->mass);
-  }
-}
-
-void move_cloth(Cloth *cloth, float dt) {
-  for (int i = 0; i < cloth->points_len; i++) {
-    Point *point = &cloth->points[i];
-    if (point->is_pinned) continue;
-    Vector3 v = Vector3Subtract(point->pos, point->prev_pos);
-    Vector3 damp = Vector3Scale(v, DAMPING);
-    point->prev_pos = point->pos;
-    point->pos = Vector3Add(point->pos, Vector3Add(damp, Vector3Scale(point->acceleration, dt * dt)));
-  }
-}
-
 // -------------------- COLLISIONS --------------------
 
 bool is_intersect(Vector3 a, Vector3 b, Vector3 c, Ray ray) {
   Vector3 n = get_normal(a, b, c);
   float denom = Vector3DotProduct(ray.direction, n);
-  if (denom < EPS) return false;
+  if (denom < 0.0f) {
+    n = Vector3Scale(n, -1.0f);
+    denom = Vector3DotProduct(ray.direction, n);
+  }
   Vector3 tmp = Vector3Subtract(a, ray.position);
   float num = Vector3DotProduct(tmp, n);
   float t = num / denom;
@@ -230,7 +197,7 @@ bool is_intersect(Vector3 a, Vector3 b, Vector3 c, Ray ray) {
   return false;
 }
 
-int get_ray_intersection_point(const Cloth *cloth, Ray ray) {
+int get_ray_intersection_polygon(const Cloth *cloth, Ray ray) {
   int ans = -1;
   float dis = FLT_MAX;
   for (int i = 0; i < cloth->polygons_len; i++) {
@@ -309,6 +276,54 @@ void check_collisions(const Cloth *cloth, const Object *objects, size_t objects_
   }
 }
 
+// -------------------- PHYSICS --------------------
+
+void apply_external_forces(Cloth *cloth, const DragContext *drag) {
+  const Polygon *polygon = drag->is_dragging ? &cloth->polygons[drag->polygon_idx] : NULL;
+  for (int i = 0; i < cloth->points_len; i++) {
+    Point *point = &cloth->points[i];
+    Vector3 force = {0.0f, -point->mass * G, 0.0f};
+    if (polygon && (i == polygon->p1 || i == polygon->p2 || i == polygon->p3)) {
+      Vector3 dir = Vector3Normalize(Vector3Subtract(drag->dir, drag->point));
+      force = Vector3Add(force, Vector3Scale(dir, DRAG_FORCE));
+    }
+    point->acceleration = Vector3Scale(force, 1.0f / point->mass);
+  }
+}
+
+void correct_springs(Cloth *cloth) {
+  for (int i = 0; i < cloth->springs_len; i++) {
+    Spring *spring = &cloth->springs[i];
+    Point *p1 = &cloth->points[spring->p1], *p2 = &cloth->points[spring->p2];
+    Vector3 dt = Vector3Subtract(p2->pos, p1->pos);
+    float dist = Vector3Length(dt);
+    float err = (dist - spring->rest_length) / dist;
+    Vector3 correction = Vector3Scale(dt, 0.5f * STIFFNESS * err);
+    if (!p1->is_pinned) p1->pos = Vector3Add(p1->pos, correction);
+    if (!p2->is_pinned) p2->pos = Vector3Subtract(p2->pos, correction);
+  }
+}
+
+void integrate_positions(Cloth *cloth, float dt) {
+  for (int i = 0; i < cloth->points_len; i++) {
+    Point *point = &cloth->points[i];
+    if (point->is_pinned) continue;
+    Vector3 v = Vector3Subtract(point->pos, point->prev_pos);
+    Vector3 damp = Vector3Scale(v, DAMPING);
+    point->prev_pos = point->pos;
+    point->pos = Vector3Add(point->pos, Vector3Add(damp, Vector3Scale(point->acceleration, dt * dt)));
+  }
+}
+
+void update_cloth_physics(Cloth *cloth, const DragContext *drag, const Object *objects, size_t objects_len, float dt) {
+  apply_external_forces(cloth, drag);
+  integrate_positions(cloth, dt);
+  for (int i = 0; i < COLLISIONS_CHECKS; i++) {
+    correct_springs(cloth);
+    check_collisions(cloth, objects, objects_len);
+  }
+}
+
 // -------------------- MAIN LOOP --------------------
 
 int main() {
@@ -327,7 +342,7 @@ int main() {
     {
       .type = OBJECT_SPHERE,
       .pos = {0.0f, 2.0f, 0.0f},
-      .color = RED,
+      .color = GRAY,
       .is_invisible = false,
       .as.sphere.radius = 2.0f,
     },
@@ -335,8 +350,8 @@ int main() {
   size_t objects_len = sizeof(objects) / sizeof(*objects);
   Orbit orbit = {.yaw = 0.0f, .pitch = 30.0f, .radius = 20.0f};
   Camera3D camera = {.target = {0.0f, 0.0f, 0.0f}, .up = {0.0f, 1.0f, 0.0f}, .fovy = 45.0f, .projection = CAMERA_PERSPECTIVE};
-  Cloth cloth = create_cloth((Vector3){-2.5f, 5.0f, -2.5f}, (Vector2){5.0f, 5.0f}, (Vector2){50.0f, 50.0f}, WHITE);
-  DragContext drag_ctx = {0};
+  Cloth cloth = create_cloth((Vector3){-2.5f, 5.0f, -2.5f}, (Vector2){5.0f, 5.0f}, (Vector2){100.0f, 100.0f}, MAROON);
+  DragContext drag = {0};
 
   while (!WindowShouldClose()) {
     float dt = GetFrameTime();
@@ -344,22 +359,19 @@ int main() {
     Ray ray = GetScreenToWorldRay(mouse_pos, camera);
 
     if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-      int idx = get_ray_intersection_point(&cloth, ray);
+      int idx = get_ray_intersection_polygon(&cloth, ray);
       if (idx != -1) {
-        drag_ctx.is_dragging = true;
-        drag_ctx.point_idx = idx;
+        drag.is_dragging = true;
+        drag.polygon_idx = idx;
+        drag.point = ray.direction;
       }
     }
-    if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) drag_ctx.is_dragging = false;
-    if (drag_ctx.is_dragging) drag_ctx.dir = ray.direction;
+    if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) drag.is_dragging = false;
+    if (drag.is_dragging) drag.dir = ray.direction;
 
     camera_handle_input(&orbit);
     camera_update_position(&camera, &orbit);
-    apply_physics(&cloth, &drag_ctx);
-    move_cloth(&cloth, dt);
-    for (int i = 0; i < 5; i++) {
-      check_collisions(&cloth, objects, objects_len);
-    }
+    update_cloth_physics(&cloth, &drag, objects, objects_len, dt);
 
     BeginDrawing();
     ClearBackground(BLACK);
