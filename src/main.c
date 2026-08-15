@@ -1,5 +1,6 @@
 #include "camera.h"
 #include <float.h>
+#include <math.h>
 #include <raylib.h>
 #include <raymath.h>
 #include <rlgl.h>
@@ -7,23 +8,33 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-// -------------------- DEFINES --------------------
+#if defined(PLATFORM_WEB)
+#include <emscripten/emscripten.h>
+#endif
 
-#define G                 (9.8f)
-#define EPS               (0.00001)
-#define FPS               (60.0f)
-#define STIFFNESS         (0.8f)
-#define DAMPING           (0.98f)
-#define FRICTION          (0.9f)
-#define DRAG_FORCE        (40000.0f)
-#define SKIN_WIDTH        (0.05f)
-#define COLLISIONS_CHECKS (8)
-#define SCREEN_WIDTH      (900.0f)
-#define SCREEN_HEIGHT     (600.0f)
-#define SCREEN_TITLE      ("Cloth simulation")
+/********************************************
+ * DEFINES                                  *
+ ********************************************/
 
-// -------------------- TYPES --------------------
+#define G                  (9.8f)
+#define K                  (20000.0f)
+#define EPS                (0.00001)
+#define FPS                (60.0f)
+#define STIFFNESS          (0.8f)
+#define DRAG_FORCE         (50000.0f)
+#define DAMPING            (0.998f)
+#define FRICTION           (0.9f)
+#define SKIN_WIDTH         (0.05f)
+#define PHYSICS_ITERATIONS (20)
+#define SCREEN_WIDTH       (900.0f)
+#define SCREEN_HEIGHT      (600.0f)
+#define SCREEN_TITLE       ("Cloth simulation")
+
+/********************************************
+ * TYPES                                    *
+ ********************************************/
 
 typedef struct {
   Vector3 pos, prev_pos;
@@ -35,6 +46,7 @@ typedef struct {
 typedef struct {
   size_t p1, p2;
   float rest_length;
+  float k;
 } Spring;
 
 typedef struct {
@@ -49,6 +61,7 @@ typedef struct {
   Polygon *polygons;
   size_t polygons_len;
   Color color;
+  bool is_wireframe;
 } Cloth;
 
 typedef enum {
@@ -64,7 +77,7 @@ typedef union {
     float width;
     float height;
     float length;
-  } rectangle;
+  } rec;
 } ObjectData;
 
 typedef struct {
@@ -82,36 +95,95 @@ typedef struct {
 
 typedef struct {
   bool is_dragging;
-  size_t polygon_idx;
-  Vector3 point;
-  Vector3 dir;
-} DragContext;
+  size_t point_idx;
+  Vector3 normal;
+  Vector3 pos;
+  Ray ray;
+} Drag;
 
-// -------------------- UTILITY --------------------
+/********************************************
+ * GLOBAL VARIABLES                         *
+ ********************************************/
 
-Cloth create_cloth(Vector3 pos, Vector2 size, Vector2 res, Color color) {
-  size_t points_len = res.x * res.y;
-  Point *points = malloc(sizeof(Point) * points_len);
+const Object objects[] = {
+  {.type = OBJECT_RECTANGLE, .pos = {0.0f, -0.5f, 0.0f}, .color = GRAY, .is_invisible = true, .as.rec = {.width = 30.0f, .height = 1.0f, .length = 30.0f,}},
+  {.type = OBJECT_SPHERE, .pos = {0.0f, 2.0f, 0.0f}, .color = GRAY, .is_invisible = false, .as.sphere.radius = 2.0f},
+};
+size_t objects_len = sizeof(objects) / sizeof(*objects);
+
+Vector4 pin = {false, false, false, false};
+Vector3 pos = {-2.5f, 5.0f, -2.5f};
+Vector2 size = {5.0f, 5.0f};
+Vector2 res = {40.0f, 40.0f};
+Cloth cloth = {0};
+Drag drag = {0};
+
+Orbit orbit = {
+  .yaw = 0.0f,
+  .pitch = 30.0f,
+  .radius = 20.0f,
+};
+
+Camera3D camera = {
+  .target = {0.0f, 0.0f, 0.0f},
+  .up = {0.0f, 1.0f, 0.0f},
+  .fovy = 45.0f,
+  .projection = CAMERA_PERSPECTIVE,
+};
+
+/********************************************
+ * UTILITY                                  *
+ ********************************************/
+
+void set_cloth_pin(Cloth *cloth, Vector2 res, Vector4 pin) {
+  for (int i = 0; i < res.y; i++) {
+    for (int j = 0; j < res.x; j++) {
+      size_t idx = res.x * i + j;
+      Point *point = &cloth->points[idx];
+      point->is_pinned = false;
+      // clang-format off
+      if ((pin.x && i == 0 && j == 0)            ||
+	  (pin.y && i == 0 && j == res.x - 1)   ||
+	  (pin.z && i == res.y - 1 && j == 0) ||
+	  (pin.w && i == res.y - 1 && j == res.x - 1)) {
+	  point->is_pinned = true;
+      }
+      // clang-format on
+    }
+  }
+}
+
+void set_cloth_position(Cloth *cloth, Vector3 pos, Vector2 size, Vector2 res) {
   float step_x = size.x / res.x;
   float step_z = size.y / res.y;
   for (int i = 0; i < res.y; i++) {
     for (int j = 0; j < res.x; j++) {
       size_t idx = res.x * i + j;
-      Point *point = &points[idx];
-      point->pos = point->prev_pos = (Vector3){pos.x + step_x * j, pos.y, pos.z + step_z * i};
+      Point *point = &cloth->points[idx];
       point->mass = 1.0f;
-      point->is_pinned = false;
+      point->pos = point->prev_pos = (Vector3){pos.x + step_x * j, pos.y, pos.z + step_z * i};
+      point->acceleration = (Vector3){0.0f, 0.0f, 0.0f};
     }
   }
+}
 
-  size_t springs_len = res.x * res.y * 2 - res.x - res.y;
+Cloth create_cloth(Vector3 pos, Vector2 size, Vector2 res, Vector4 pin, Color color) {
+  size_t points_len = res.x * res.y;
+  Point *points = malloc(sizeof(Point) * points_len);
+  float step_x = size.x / res.x;
+  float step_z = size.y / res.y;
+
+  size_t springs_len = res.x * res.y * 4 - res.x * 3 - res.y * 3 + 2;
   Spring *springs = malloc(sizeof(Spring) * springs_len);
+  float diagonal = sqrt(step_x * step_x + step_z * step_z);
   size_t curr_spring = 0;
   for (int i = 0; i < res.y; i++) {
     for (int j = 0; j < res.x; j++) {
       size_t idx = res.x * i + j;
-      if (j < res.x - 1) springs[curr_spring++] = (Spring){idx, idx + 1, step_x};
-      if (i < res.y - 1) springs[curr_spring++] = (Spring){idx, idx + res.x, step_z};
+      if (i < res.y - 1) springs[curr_spring++] = (Spring){idx, idx + res.x, step_z, K};
+      if (j < res.x - 1) springs[curr_spring++] = (Spring){idx, idx + 1, step_x, K};
+      if (i < res.y - 1 && j < res.x - 1) springs[curr_spring++] = (Spring){idx, idx + res.x + 1, diagonal, K * 0.5f};
+      if (i < res.y - 1 && j > 0) springs[curr_spring++] = (Spring){idx, idx + res.x - 1, diagonal, K * 0.5f};
     }
   }
 
@@ -126,7 +198,7 @@ Cloth create_cloth(Vector3 pos, Vector2 size, Vector2 res, Color color) {
     }
   }
 
-  return (Cloth){
+  Cloth cloth = {
     .points = points,
     .points_len = points_len,
     .springs = springs,
@@ -135,6 +207,9 @@ Cloth create_cloth(Vector3 pos, Vector2 size, Vector2 res, Color color) {
     .polygons_len = polygons_len,
     .color = color,
   };
+  set_cloth_position(&cloth, pos, size, res);
+  set_cloth_pin(&cloth, res, pin);
+  return cloth;
 }
 
 void free_cloth(const Cloth *cloth) {
@@ -149,12 +224,21 @@ Vector3 get_normal(Vector3 a, Vector3 b, Vector3 c) {
   return Vector3CrossProduct(ab, ac);
 }
 
-// -------------------- RENDERERS --------------------
+/********************************************
+ * RENDERERS                                *
+ ********************************************/
 
 void draw_cloth(const Cloth *cloth) {
   for (int i = 0; i < cloth->polygons_len; i++) {
     const Polygon *polygon = &cloth->polygons[i];
-    DrawTriangle3D(cloth->points[polygon->p1].pos, cloth->points[polygon->p2].pos, cloth->points[polygon->p3].pos, cloth->color);
+    const Point *a = &cloth->points[polygon->p1], *b = &cloth->points[polygon->p2], *c = &cloth->points[polygon->p3];
+    if (cloth->is_wireframe) {
+      DrawLine3D(a->pos, b->pos, cloth->color);
+      DrawLine3D(b->pos, c->pos, cloth->color);
+      DrawLine3D(c->pos, a->pos, cloth->color);
+      continue;
+    }
+    DrawTriangle3D(a->pos, b->pos, c->pos, cloth->color);
   }
 }
 
@@ -167,26 +251,34 @@ void draw_objects(const Object *objects, size_t len) {
       DrawSphere(object->pos, object->as.sphere.radius, object->color);
       break;
     case OBJECT_RECTANGLE:
-      DrawCube(object->pos, object->as.rectangle.width, object->as.rectangle.height, object->as.rectangle.length, object->color);
+      DrawCube(object->pos, object->as.rec.width, object->as.rec.height, object->as.rec.length, object->color);
       break;
     }
   }
 }
 
-// -------------------- COLLISIONS --------------------
+/********************************************
+ * COLLISIONS                               *
+ ********************************************/
 
-bool is_intersect(Vector3 a, Vector3 b, Vector3 c, Ray ray) {
-  Vector3 n = get_normal(a, b, c);
-  float denom = Vector3DotProduct(ray.direction, n);
+bool get_plane_intersection(Vector3 plane_point, Vector3 plane_normal, Ray ray, Vector3 *dest) {
+  float denom = Vector3DotProduct(ray.direction, plane_normal);
   if (denom < 0.0f) {
-    n = Vector3Scale(n, -1.0f);
-    denom = Vector3DotProduct(ray.direction, n);
+    plane_normal = Vector3Scale(plane_normal, -1.0f);
+    denom = Vector3DotProduct(ray.direction, plane_normal);
   }
-  Vector3 tmp = Vector3Subtract(a, ray.position);
-  float num = Vector3DotProduct(tmp, n);
+  Vector3 tmp = Vector3Subtract(plane_point, ray.position);
+  float num = Vector3DotProduct(tmp, plane_normal);
   float t = num / denom;
   if (t < 0.0f) return false;
-  Vector3 x = Vector3Add(ray.position, Vector3Scale(ray.direction, t));
+  *dest = Vector3Add(ray.position, Vector3Scale(ray.direction, t));
+  return true;
+}
+
+bool get_triangle_intersetion(Vector3 a, Vector3 b, Vector3 c, Ray ray) {
+  Vector3 x;
+  Vector3 n = get_normal(a, b, c);
+  if (!get_plane_intersection(a, n, ray, &x)) return false;
   Vector3 n1 = Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(x, a));
   Vector3 n2 = Vector3CrossProduct(Vector3Subtract(c, b), Vector3Subtract(x, b));
   Vector3 n3 = Vector3CrossProduct(Vector3Subtract(a, c), Vector3Subtract(x, c));
@@ -197,15 +289,15 @@ bool is_intersect(Vector3 a, Vector3 b, Vector3 c, Ray ray) {
   return false;
 }
 
-int get_ray_intersection_polygon(const Cloth *cloth, Ray ray) {
+int get_ray_intersection_point(const Cloth *cloth, Ray ray) {
   int ans = -1;
   float dis = FLT_MAX;
   for (int i = 0; i < cloth->polygons_len; i++) {
     const Polygon *polygon = &cloth->polygons[i];
     const Point *a = &cloth->points[polygon->p1], *b = &cloth->points[polygon->p2], *c = &cloth->points[polygon->p3];
     float curr_dis = Vector3Distance(ray.position, a->pos);
-    if (is_intersect(a->pos, b->pos, c->pos, ray) && curr_dis < dis) {
-      ans = i;
+    if (get_triangle_intersetion(a->pos, b->pos, c->pos, ray) && curr_dis < dis) {
+      ans = polygon->p1;
       dis = curr_dis;
     }
   }
@@ -239,7 +331,7 @@ Contact get_rectangle_contact(Vector3 pos, Vector3 min, Vector3 max) {
 }
 
 void check_rectangle_collision(Point *point, const Object *rec) {
-  float width = rec->as.rectangle.width, height = rec->as.rectangle.height, length = rec->as.rectangle.length;
+  float width = rec->as.rec.width, height = rec->as.rec.height, length = rec->as.rec.length;
   Vector3 half = {width / 2.0f, height / 2.0f, length / 2.0f};
   Vector3 min = Vector3Subtract(rec->pos, half);
   Vector3 max = Vector3Add(rec->pos, half);
@@ -276,31 +368,37 @@ void check_collisions(const Cloth *cloth, const Object *objects, size_t objects_
   }
 }
 
-// -------------------- PHYSICS --------------------
+/********************************************
+ * PHYSICS                                  *
+ ********************************************/
 
-void apply_external_forces(Cloth *cloth, const DragContext *drag) {
-  const Polygon *polygon = drag->is_dragging ? &cloth->polygons[drag->polygon_idx] : NULL;
+void apply_external_forces(Cloth *cloth, const Drag *drag) {
+  Vector3 spring_forces[cloth->points_len];
   for (int i = 0; i < cloth->points_len; i++) {
-    Point *point = &cloth->points[i];
-    Vector3 force = {0.0f, -point->mass * G, 0.0f};
-    if (polygon && (i == polygon->p1 || i == polygon->p2 || i == polygon->p3)) {
-      Vector3 dir = Vector3Normalize(Vector3Subtract(drag->dir, drag->point));
-      force = Vector3Add(force, Vector3Scale(dir, DRAG_FORCE));
-    }
-    point->acceleration = Vector3Scale(force, 1.0f / point->mass);
+    spring_forces[i] = (Vector3){0.0f, 0.0f, 0.0f};
   }
-}
-
-void correct_springs(Cloth *cloth) {
   for (int i = 0; i < cloth->springs_len; i++) {
     Spring *spring = &cloth->springs[i];
     Point *p1 = &cloth->points[spring->p1], *p2 = &cloth->points[spring->p2];
-    Vector3 dt = Vector3Subtract(p2->pos, p1->pos);
-    float dist = Vector3Length(dt);
-    float err = (dist - spring->rest_length) / dist;
-    Vector3 correction = Vector3Scale(dt, 0.5f * STIFFNESS * err);
-    if (!p1->is_pinned) p1->pos = Vector3Add(p1->pos, correction);
-    if (!p2->is_pinned) p2->pos = Vector3Subtract(p2->pos, correction);
+    Vector3 dir = Vector3Normalize(Vector3Subtract(p2->pos, p1->pos));
+    float dt = Vector3Distance(p1->pos, p2->pos) - spring->rest_length;
+    Vector3 spring_force = Vector3Scale(dir, spring->k * dt);
+    spring_forces[spring->p1] = Vector3Add(spring_forces[spring->p1], spring_force);
+    spring_forces[spring->p2] = Vector3Subtract(spring_forces[spring->p2], spring_force);
+  }
+  for (int i = 0; i < cloth->points_len; i++) {
+    Point *point = &cloth->points[i];
+    Vector3 spring_force = spring_forces[i];
+    Vector3 gravity_force = {0.0f, -point->mass * G, 0.0f};
+    Vector3 force = Vector3Add(spring_force, gravity_force);
+    if (drag->is_dragging && drag->point_idx == i) {
+      Vector3 x;
+      if (get_plane_intersection(drag->pos, drag->normal, drag->ray, &x)) {
+        Vector3 dir = Vector3Normalize(Vector3Subtract(x, point->pos));
+        force = Vector3Add(force, Vector3Scale(dir, DRAG_FORCE));
+      }
+    }
+    point->acceleration = Vector3Scale(force, 1.0f / point->mass);
   }
 }
 
@@ -315,75 +413,82 @@ void integrate_positions(Cloth *cloth, float dt) {
   }
 }
 
-void update_cloth_physics(Cloth *cloth, const DragContext *drag, const Object *objects, size_t objects_len, float dt) {
-  apply_external_forces(cloth, drag);
-  integrate_positions(cloth, dt);
-  for (int i = 0; i < COLLISIONS_CHECKS; i++) {
-    correct_springs(cloth);
+void update_cloth_physics(Cloth *cloth, const Drag *drag, const Object *objects, size_t objects_len, float dt) {
+  float sub_dt = dt / PHYSICS_ITERATIONS;
+  for (int i = 0; i < PHYSICS_ITERATIONS; i++) {
+    apply_external_forces(cloth, drag);
+    integrate_positions(cloth, sub_dt);
     check_collisions(cloth, objects, objects_len);
   }
 }
 
-// -------------------- MAIN LOOP --------------------
+/********************************************
+ * MAIN LOOP                                  *
+ ********************************************/
+
+void update_draw_frame(void) {
+  float dt = GetFrameTime();
+  Vector2 mouse_pos = GetMousePosition();
+  Ray ray = GetScreenToWorldRay(mouse_pos, camera);
+
+  // Dragging
+  if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+    int idx = get_ray_intersection_point(&cloth, ray);
+    if (idx != -1) {
+      const Point *point = &cloth.points[idx];
+      drag.is_dragging = true;
+      drag.point_idx = idx;
+      drag.pos = point->pos;
+      drag.normal = Vector3Subtract(camera.position, point->pos);
+    }
+  }
+  if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) drag.is_dragging = false;
+  if (drag.is_dragging) drag.ray = ray;
+
+  // Pin
+  Vector4 new_pin = pin;
+  if (IsKeyPressed(KEY_Q)) new_pin.x = !new_pin.x;
+  if (IsKeyPressed(KEY_W)) new_pin.y = !new_pin.y;
+  if (IsKeyPressed(KEY_A)) new_pin.z = !new_pin.z;
+  if (IsKeyPressed(KEY_S)) new_pin.w = !new_pin.w;
+  if (memcmp(&pin, &new_pin, sizeof(pin))) {
+    pin = new_pin;
+    set_cloth_pin(&cloth, res, new_pin);
+  }
+  if (IsKeyPressed(KEY_R)) set_cloth_position(&cloth, pos, size, res);
+
+  // Other input
+  if (IsKeyPressed(KEY_F1)) cloth.is_wireframe = !cloth.is_wireframe;
+
+  camera_handle_input(&orbit);
+  camera_update_position(&camera, &orbit);
+  update_cloth_physics(&cloth, &drag, objects, objects_len, dt);
+
+  BeginDrawing();
+  ClearBackground(BLACK);
+  DrawFPS(10, 10);
+  BeginMode3D(camera);
+  DrawGrid(30, 1);
+  draw_cloth(&cloth);
+  draw_objects(objects, objects_len);
+  EndMode3D();
+  EndDrawing();
+}
 
 int main() {
   InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_TITLE);
-  SetTargetFPS(FPS);
   rlDisableBackfaceCulling();
+  cloth = create_cloth(pos, size, res, pin, MAROON);
 
-  const Object objects[] = {
-    {
-      .type = OBJECT_RECTANGLE,
-      .pos = {0.0f, -0.5f, 0.0f},
-      .color = RED,
-      .is_invisible = true,
-      .as.rectangle = {.width = 30.0f, .height = 1.0f, .length = 30.0f},
-    },
-    {
-      .type = OBJECT_SPHERE,
-      .pos = {0.0f, 2.0f, 0.0f},
-      .color = GRAY,
-      .is_invisible = false,
-      .as.sphere.radius = 2.0f,
-    },
-  };
-  size_t objects_len = sizeof(objects) / sizeof(*objects);
-  Orbit orbit = {.yaw = 0.0f, .pitch = 30.0f, .radius = 20.0f};
-  Camera3D camera = {.target = {0.0f, 0.0f, 0.0f}, .up = {0.0f, 1.0f, 0.0f}, .fovy = 45.0f, .projection = CAMERA_PERSPECTIVE};
-  Cloth cloth = create_cloth((Vector3){-2.5f, 5.0f, -2.5f}, (Vector2){5.0f, 5.0f}, (Vector2){100.0f, 100.0f}, MAROON);
-  DragContext drag = {0};
-
+#if defined(PLATFORM_WEB)
+  emscripten_set_main_loop(update_draw_frame, 0, 1);
+#else
+  SetTargetFPS(FPS);
   while (!WindowShouldClose()) {
-    float dt = GetFrameTime();
-    Vector2 mouse_pos = GetMousePosition();
-    Ray ray = GetScreenToWorldRay(mouse_pos, camera);
-
-    if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-      int idx = get_ray_intersection_polygon(&cloth, ray);
-      if (idx != -1) {
-        drag.is_dragging = true;
-        drag.polygon_idx = idx;
-        drag.point = ray.direction;
-      }
-    }
-    if (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) drag.is_dragging = false;
-    if (drag.is_dragging) drag.dir = ray.direction;
-
-    camera_handle_input(&orbit);
-    camera_update_position(&camera, &orbit);
-    update_cloth_physics(&cloth, &drag, objects, objects_len, dt);
-
-    BeginDrawing();
-    ClearBackground(BLACK);
-    DrawFPS(10, 10);
-    BeginMode3D(camera);
-    DrawGrid(30, 1);
-    draw_cloth(&cloth);
-    draw_objects(objects, objects_len);
-    EndMode3D();
-    EndDrawing();
+    update_draw_frame();
   }
+#endif
 
-  free_cloth(&cloth);
   CloseWindow();
+  free_cloth(&cloth);
 }
